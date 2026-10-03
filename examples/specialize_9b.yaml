@@ -1,0 +1,46 @@
+# Local QLoRA specialization of the retained causal checkpoint.
+# Download/copy the complete parent artifact to checkpoints/decision-9b first.
+schema_version: 2
+recipe: decision
+experiment_name: typed-decisions-9b-qlora-specialist
+model:
+  name: ../checkpoints/decision-9b
+  adapter: qlora_causal
+  adapter_kwargs:
+    rank: 32
+    alpha: 64
+    dropout: 0.05
+  dtype: bfloat16
+  gradient_checkpointing: true
+  adaptation: qlora
+data:
+  train: ../data/typed-decisions/train.jsonl
+  validation: ../data/typed-decisions/validation.jsonl
+  max_length: 768
+  max_candidates: 8
+objective:
+  type: candidate_distillation
+  alpha: 1.0
+  temperature: 1.0
+training:
+  backend: torch_single
+  device: cuda
+  epochs: 1
+  batch_size: 1
+  gradient_accumulation: 8
+  learning_rate: 0.0001
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  seed: 42
+  evaluate_reversed_options: false
+summitConfig:
+  backends: [runpod]
+  resources:
+    gpu: RTX5090-32GB:1
+    rollout_gpus: 0
+    disk: 100GB
+  max_duration: 4h
+  retry_on_error: false
+  retry_on_interruption: false
+  output:
+    directory: ../outputs/specialize-9b

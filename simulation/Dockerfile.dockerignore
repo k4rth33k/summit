@@ -1,0 +1,7 @@
+# Send only build inputs; never send .env, datasets, or local model weights.
+**
+!simulation/
+!simulation/Dockerfile
+!simulation/patch_upstream.py
+!summit/
+!summit/runtime-requirements.txt

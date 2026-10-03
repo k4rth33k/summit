@@ -1,0 +1,5 @@
+# SGLang 0.5.9 pins torch 2.9.1, whose wheel metadata pins cuDNN 9.10.
+# That cuDNN release crashes SGLang's Conv3d startup path; 9.16 contains the
+# upstream fix. uv's override makes the resolver select 9.16 directly instead
+# of downloading 9.10 and replacing it after installation.
+nvidia-cudnn-cu12==9.16.0.29

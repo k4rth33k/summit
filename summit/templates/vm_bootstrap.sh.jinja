@@ -1,0 +1,553 @@
+#!/bin/bash
+# summit v0.1 — single-VM bring-up + OPD run + HF push + clean exit.
+# Rendered by summit; runs as the dstack task's main command on an 8xGPU VM.
+set -euo pipefail
+
+export EXPERIMENT_PATH=/workspace/experiment
+export NEXRL_DATA_PATH=/workspace/data
+export SUMMIT_REPO_DIR="$PWD"
+export API_SERVER_URL=127.0.0.1
+# NexRL talks to the SGLang **router** (provides /workers for weight sync);
+# the router proxies to the actual SGLang server on 8001.
+export INFERENCE_BASE_URL=127.0.0.1:12345
+export SUMMIT_TEACHER_MODEL="{{ teacher_model }}"
+export SUMMIT_TEACHER_BASE_URL="{{ teacher_base_url }}"
+export SUMMIT_TRAIN_SUCCESS_FILE="$EXPERIMENT_PATH/train-successful-updates"
+export SUMMIT_ROLLOUT_RESULT_FILE="$EXPERIMENT_PATH/rollout-results"
+export WANDB_KEY="${WANDB_KEY:-${WANDB_API_KEY:-}}"
+export WANDB_HOST="${WANDB_HOST:-https://api.wandb.ai}"
+export HF_XET_HIGH_PERFORMANCE=1
+export TOKENIZERS_PARALLELISM=false
+mkdir -p "$EXPERIMENT_PATH" "$NEXRL_DATA_PATH"
+cp "$SUMMIT_REPO_DIR/run/rl_train.yaml" "$EXPERIMENT_PATH/rl_train.yaml"
+
+STUDENT_MODEL="{{ student_model }}"
+SERVED_NAME="{{ served_model_name }}"
+TRAIN_GPUS={{ train_gpus }}
+ROLLOUT_GPUS={{ rollout_gpus }}
+OPTIMIZER="{{ optimizer }}"
+MEMORY_EFFICIENT_FSDP="{{ memory_efficient_fsdp | lower }}"
+CKPT_DIR="$EXPERIMENT_PATH/ckpt"
+HF_EXPORT_DIR="$EXPERIMENT_PATH/hf_export"
+
+dump_logs() {
+  echo "================ summit: failure — tailing logs ================"
+  for f in "$EXPERIMENT_PATH"/*.log /workspace/*.log; do
+    [ -f "$f" ] && { echo "----- $f -----"; tail -n 200 "$f"; }
+  done
+}
+trap 'dump_logs' ERR
+
+echo "== [0/7] machine diagnostics =="
+nvidia-smi || true
+free -g || true
+df -h / /workspace /dev/shm || true
+
+echo "== [1/7] parallel runtime setup =="
+
+setup_nexrl() {
+  uv venv /opt/venv-nexrl --python 3.12
+
+  # NexRL (pinned upstream) + summit (mounted repo, no heavy deps) + VM extras.
+  # NexRL is installed --no-deps: its declared deps pull
+  # tinker-cookbook@main, which conflicts with the torch 2.7.1 runtime.
+  uv pip install --python /opt/venv-nexrl/bin/python --no-deps \
+    "NexRL @ git+https://github.com/nex-agi/NexRL.git@{{ nexrl_ref }}"
+  uv pip install --python /opt/venv-nexrl/bin/python \
+    -r "$SUMMIT_REPO_DIR/summit/runtime-requirements.txt"
+{% if blackwell %}
+  # PyPI's torch 2.7.1 wheel is cu126 and has no sm_120 kernels. Blackwell
+  # requires the official cu128 build; reinstalling here takes about 30s.
+  uv pip install --python /opt/venv-nexrl/bin/python \
+    --index-url https://download.pytorch.org/whl/cu128 \
+    --reinstall torch==2.7.1
+{% endif %}
+  # Required by NexRL's top-level fsdp_actor.py import even though the model
+  # loader is patched to eager attention below.
+  uv pip install --python /opt/venv-nexrl/bin/python \
+    "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post1/flash_attn-2.8.3.post1+cu12torch2.7cxx11abiTRUE-cp312-cp312-linux_x86_64.whl"
+  uv pip install --python /opt/venv-nexrl/bin/python --no-deps -e "$SUMMIT_REPO_DIR"
+  # The zz_ prefix places the compatibility shim after uv's editable .pth.
+  local site
+  site=$(/opt/venv-nexrl/bin/python -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+  echo "import summit.nexrl_ext.compat; summit.nexrl_ext.compat.apply()" > "$site/zz_summit_compat.pth"
+
+  # Guarded patches run after the compatibility .pth is installed.
+  local core_algos fsdp_actor fsdp_workers tracking worker_process
+  fsdp_workers=$(/opt/venv-nexrl/bin/python -c "import nexrl.train_service_backend.fsdp_worker.fsdp_workers as m; print(m.__file__)")
+  grep -q 'attn_implementation="flash_attention_2"' "$fsdp_workers" || { echo "fsdp_workers.py patch target not found"; return 1; }
+  sed -i 's/attn_implementation="flash_attention_2"/attn_implementation="eager"/' "$fsdp_workers"
+  echo "patched fsdp_workers.py: flash_attention_2 -> eager"
+
+  if [ "$OPTIMIZER" = "adafactor" ]; then
+    grep -q 'actor_optimizer = optim.AdamW(' "$fsdp_workers" || { echo "AdamW patch target not found"; return 1; }
+    sed -i 's/actor_optimizer = optim.AdamW(/actor_optimizer = __import__("summit.nexrl_ext.optimizer", fromlist=["adafactor"]).adafactor(/' "$fsdp_workers"
+    echo "patched fsdp_workers.py: AdamW -> Adafactor"
+  fi
+  if [ "$MEMORY_EFFICIENT_FSDP" = "true" ]; then
+    grep -q 'forward_prefetch=True' "$fsdp_workers" || { echo "forward prefetch patch target not found"; return 1; }
+    grep -q 'BackwardPrefetch.BACKWARD_PRE' "$fsdp_workers" || { echo "backward prefetch patch target not found"; return 1; }
+    sed -i 's/forward_prefetch=True/forward_prefetch=False/' "$fsdp_workers"
+    sed -i 's/BackwardPrefetch.BACKWARD_PRE/BackwardPrefetch.BACKWARD_POST/' "$fsdp_workers"
+    echo "patched fsdp_workers.py: memory-efficient FSDP prefetch"
+  fi
+
+  # Bind NCCL to the rank's already-selected CUDA device. This avoids lazy
+  # communicator startup guessing a device at NexRL's first barrier.
+  /opt/venv-nexrl/bin/python - "$fsdp_workers" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = '''            torch.distributed.init_process_group(
+                backend="nccl", timeout=datetime.timedelta(seconds=1800)
+            )'''
+new = '''            torch.distributed.init_process_group(
+                backend="nccl",
+                timeout=datetime.timedelta(seconds=1800),
+                device_id=torch.device("cuda", torch.cuda.current_device()),
+            )'''
+if s.count(old) != 1:
+    print("NCCL device binding patch target missing or ambiguous", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PYEOF
+  echo "patched fsdp_workers.py: bind NCCL process group to local CUDA device"
+
+  # NexRL computes the response-only mask but omits it from the batch sent to
+  # update_actor_with_distillation. Without it the worker falls back to the
+  # ordinary attention mask and optimizes prompt tokens as well as responses.
+  local opd_trainer
+  opd_trainer=$(/opt/venv-nexrl/bin/python -c "import nexrl.trainer.self_hosted_opd_trainer as m; print(m.__file__)")
+  /opt/venv-nexrl/bin/python - "$opd_trainer" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = '''                "teacher_log_probs",
+                "old_student_log_probs",
+            ]
+            backend_batch = batch.trim_for_backend(_BACKEND_DISTILLATION_KEYS)'''
+new = '''                "teacher_log_probs",
+                "old_student_log_probs",
+                "scoring_attention_mask",
+            ]
+            backend_batch = batch.trim_for_backend(_BACKEND_DISTILLATION_KEYS)'''
+if s.count(old) != 1:
+    print("OPD scoring mask patch target missing or ambiguous", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PYEOF
+  echo "patched self_hosted_opd_trainer.py: preserve response scoring mask"
+
+  # NexRL v1.4.0 leaves the score-function form of reverse KL commented out
+  # and differentiates E[log p - log q] as though sampled tokens were fixed.
+  # That gradient loses the teacher-dependent term. Activate the upstream
+  # surrogate whose forward value is unchanged but whose gradient is
+  # (1 + log p - log q) * grad(log p).
+  core_algos=$(/opt/venv-nexrl/bin/python -c "import nexrl.train_service_backend.utils.core_algos as m; print(m.__file__)")
+  /opt/venv-nexrl/bin/python - "$core_algos" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = '''    # Aggregate loss
+    reverse_kl_loss = agg_loss(
+        loss_mat=token_wise_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+    )'''
+new = '''    # Score-function surrogate for samples drawn from the student. Its
+    # forward value equals token_wise_kl, while autograd also includes the
+    # derivative of the sampling distribution.
+    pseudo_ratio = torch.exp(student_log_probs - student_log_probs.detach())
+    surrogate_kl = token_wise_kl * pseudo_ratio
+    reverse_kl_loss = agg_loss(
+        loss_mat=surrogate_kl, loss_mask=response_mask, loss_agg_mode=loss_agg_mode
+    )'''
+if s.count(old) != 1:
+    print("reverse-KL surrogate patch target missing or ambiguous", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PYEOF
+  echo "patched core_algos.py: reverse-KL score-function surrogate"
+
+  # DeepSWE emits bookkeeping trajectories whose response scoring mask is
+  # empty. Avoid a full 4K-token model forward for each one, and divide the
+  # accumulated gradient by the number of active microbatches only.
+  fsdp_actor=$(/opt/venv-nexrl/bin/python -c "import nexrl.train_service_backend.fsdp_worker.fsdp_actor as m; print(m.__file__)")
+  /opt/venv-nexrl/bin/python - "$fsdp_actor" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+start = s.index("    def update_policy_with_distillation(")
+end = s.index("    def update_policy(", start)
+section = s[start:end]
+old = '''                self.actor_optimizer.zero_grad()
+
+                for micro_batch_data in micro_batches:
+                    micro_batch_data = micro_batch_data.cuda()'''
+new = '''                active_micro_batches = []
+                for candidate in micro_batches:
+                    candidate_response_length = candidate["responses"].size(1)
+                    candidate_mask = candidate.get("scoring_attention_mask")
+                    if candidate_mask is None:
+                        candidate_mask = candidate["attention_mask"]
+                    if candidate_mask[:, -candidate_response_length:].sum().item() > 0:
+                        active_micro_batches.append(candidate)
+                dropped = len(micro_batches) - len(active_micro_batches)
+                if dropped:
+                    print(
+                        f"[update_policy_with_distillation] Skipping {dropped} "
+                        "zero-response microbatches before model forward"
+                    )
+                if not active_micro_batches:
+                    print(
+                        "[update_policy_with_distillation] Entire optimizer "
+                        "minibatch has no trainable response tokens; skipping"
+                    )
+                    continue
+                micro_batches = active_micro_batches
+                if not self.config.use_dynamic_bsz:
+                    gradient_accumulation = len(micro_batches)
+
+                self.actor_optimizer.zero_grad()
+
+                for micro_batch_data in micro_batches:
+                    micro_batch_data = micro_batch_data.cuda()'''
+if section.count(old) != 1:
+    print("zero-response microbatch patch target missing or ambiguous", file=sys.stderr)
+    sys.exit(1)
+section = section.replace(old, new)
+p.write_text(s[:start] + section + s[end:])
+PYEOF
+  echo "patched fsdp_actor.py: skip zero-response microbatches"
+
+# HF export: a first convert attempt that catches a busy handle poisons the
+# FSDP `_unshard_params_ctx` on every retry (torch assert deadlock). Rewrite
+# convert_ckpt_to_huggingface to clear the ctx in a finally so retries rerun.
+  /opt/venv-nexrl/bin/python - "$fsdp_workers" <<'PYEOF'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+START = "    def convert_ckpt_to_huggingface(self, local_path):"
+END = "    def barrier(self):"
+if START not in s or END not in s:
+    print("convert patch anchor missing", file=sys.stderr); sys.exit(1)
+i, j = s.index(START), s.index(END)
+NEW = '''    def convert_ckpt_to_huggingface(self, local_path):
+        import torch
+        try:
+            with FSDP.state_dict_type(
+                self.actor.actor_module,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+            ):
+                state_dict = self.actor.actor_module.state_dict()
+                if torch.distributed.get_rank() == 0:
+                    self.actor_module.save_pretrained(save_directory=local_path, state_dict=state_dict)
+                    self.tokenizer.save_pretrained(local_path)
+        finally:
+            # summit: clear poisoned unshard ctx on all FSDP states
+            for mod in self.actor.actor_module.modules():
+                state = getattr(mod, "_fsdp_state", None)
+                ctx = getattr(state, "_unshard_params_ctx", None)
+                if ctx is not None:
+                    state._unshard_params_ctx = None
+
+'''
+p.write_text(s[:i] + NEW + s[j:])
+PYEOF
+  echo "patched fsdp_workers.py: convert clears unshard ctx"
+
+  # This RunPod Blackwell topology reports direct P2P links but NCCL scatter
+  # faults even with P2P disabled. FSDP broadcast/all-reduce are healthy, so
+  # emulate the small input scatter with one ordered broadcast per DP chunk.
+  worker_process=$(/opt/venv-nexrl/bin/python -c "import nexrl.train_service_backend.distributed.worker_process as m; print(m.__file__)")
+  /opt/venv-nexrl/bin/python - "$worker_process" <<'PYEOF'
+import pathlib, sys
+p = pathlib.Path(sys.argv[1])
+s = p.read_text()
+old = """                if self.rank == src_rank:
+                    assert dp_chunks is not None
+                    # CRITICAL: Move each unique DP chunk to GPU ONCE, then reuse
+                    # the reference for all SP ranks in that group. This avoids
+                    # sp_size duplicate .cuda() copies per chunk.
+                    tensor_scatter_list = []
+                    for dp_rank in range(dp_size):
+                        chunk_cuda = dp_chunks[dp_rank].batch[key].cuda()
+                        for _sp_rank in range(sp_size):
+                            tensor_scatter_list.append(chunk_cuda)  # Same GPU tensor ref
+                else:
+                    tensor_scatter_list = None
+
+                # Allocate output tensor on all ranks
+                tensor_meta = metadata[\"tensor_metadata\"][key]
+                output_tensor = torch.empty(
+                    tensor_meta[\"shape\"],
+                    dtype=getattr(torch, tensor_meta[\"dtype\"].split(\".\")[-1]),
+                    device=\"cuda\",
+                )
+
+                # Scatter this tensor
+                torch.distributed.scatter(output_tensor, tensor_scatter_list, src=src_rank)
+
+                # CRITICAL: Immediately free the scatter list on rank 0
+                if self.rank == src_rank:
+                    del tensor_scatter_list
+                    torch.cuda.empty_cache()
+
+                scattered_tensors[key] = output_tensor
+"""
+new = """                tensor_meta = metadata[\"tensor_metadata\"][key]
+                dtype = getattr(torch, tensor_meta[\"dtype\"].split(\".\")[-1])
+                output_tensor = None
+                target_dp_rank = self.rank // sp_size
+                # summit: emulate scatter with broadcasts. NCCL scatter faults on
+                # the validated RunPod Blackwell host, while broadcast is healthy.
+                for dp_rank in range(dp_size):
+                    if self.rank == src_rank:
+                        assert dp_chunks is not None
+                        transfer = dp_chunks[dp_rank].batch[key].to(device=\"cuda\", dtype=dtype)
+                    else:
+                        transfer = torch.empty(
+                            tensor_meta[\"shape\"], dtype=dtype, device=\"cuda\"
+                        )
+                    torch.distributed.broadcast(transfer, src=src_rank)
+                    torch.cuda.synchronize()
+                    if target_dp_rank == dp_rank:
+                        output_tensor = transfer
+                    else:
+                        del transfer
+                assert output_tensor is not None
+                scattered_tensors[key] = output_tensor
+"""
+if s.count(old) != 1:
+    print("NCCL scatter emulation patch target missing or ambiguous", file=sys.stderr)
+    sys.exit(1)
+p.write_text(s.replace(old, new))
+PYEOF
+  echo "patched worker_process.py: emulate NCCL scatter with broadcasts"
+
+# wandb 0.29 removed Run.get_url(); NexRL v1.4.0 still calls it (tracking.py).
+# Guard the call with getattr (returns None -> wandb_url falls back to "").
+# v1.4.0 line; the grep fails the build loudly on upstream drift.
+  tracking=$(/opt/venv-nexrl/bin/python -c "import nexrl.utils.tracking as m; print(m.__file__)")
+  grep -q 'wandb_run.get_url()' "$tracking" || { echo "tracking.py patch target not found"; return 1; }
+  sed -i 's/wandb_run.get_url()/getattr(wandb_run, "get_url", lambda: None)()/' "$tracking"
+  echo "patched tracking.py: get_url guarded"
+}
+
+setup_sglang() {
+  uv venv /opt/venv-sglang --python 3.12
+  # Resolve once with the known-good cuDNN version. The old two-command setup
+  # downloaded cuDNN 9.10 and then discarded it for 9.16 (about 1.3 GB total).
+  uv pip install --python /opt/venv-sglang/bin/python \
+    --overrides "$SUMMIT_REPO_DIR/summit/sglang-overrides.txt" \
+    "sglang[all]==0.5.9" "sglang-router==0.3.2" \
+    "nvidia-cudnn-cu12==9.16.0.29"
+}
+
+prefetch_model() {
+  # Start the model transfer immediately instead of waiting for SGLang. This
+  # isolated helper only seeds the shared Hugging Face cache.
+  uv run --isolated --no-project --with "huggingface_hub==1.32.0" \
+    python - "$STUDENT_MODEL" <<'PYEOF'
+import os
+import sys
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id=sys.argv[1],
+    token=os.environ.get("HF_TOKEN"),
+    max_workers=16,
+)
+PYEOF
+}
+
+fetch_tasks() {
+  git clone --depth 1 https://github.com/datacurve-ai/deep-swe /workspace/deep-swe
+}
+
+run_setup_branch() {
+  local name="$1"
+  shift
+  "$@" > >(sed -u "s/^/[$name] /" | tee -a "$EXPERIMENT_PATH/setup-$name.log") 2>&1
+}
+
+# Package downloads, model weights and task checkout are independent. Run all
+# four while the expensive GPU node is otherwise idle. uv and HF each manage
+# their own atomic cache entries.
+run_setup_branch trainer setup_nexrl &
+TRAINER_SETUP_PID=$!
+run_setup_branch sglang setup_sglang &
+SGLANG_SETUP_PID=$!
+run_setup_branch model prefetch_model &
+MODEL_SETUP_PID=$!
+run_setup_branch tasks fetch_tasks &
+TASKS_SETUP_PID=$!
+
+SETUP_PIDS=("$TRAINER_SETUP_PID" "$SGLANG_SETUP_PID" "$MODEL_SETUP_PID" "$TASKS_SETUP_PID")
+declare -A SETUP_NAMES=(
+  ["$TRAINER_SETUP_PID"]="trainer"
+  ["$SGLANG_SETUP_PID"]="sglang"
+  ["$MODEL_SETUP_PID"]="model"
+  ["$TASKS_SETUP_PID"]="tasks"
+)
+while [ -n "${SETUP_PIDS[*]:-}" ]; do
+  set +e
+  wait -n -p FINISHED_SETUP_PID "${SETUP_PIDS[@]}"
+  SETUP_RC=$?
+  set -e
+  FINISHED_SETUP_NAME="${SETUP_NAMES[$FINISHED_SETUP_PID]:-unknown}"
+  if [ "$SETUP_RC" -ne 0 ]; then
+    echo "setup branch $FINISHED_SETUP_NAME failed with $SETUP_RC"
+    for pid in "${SETUP_PIDS[@]}"; do
+      [ "$pid" = "$FINISHED_SETUP_PID" ] || kill "$pid" 2>/dev/null || true
+    done
+    wait || true
+    dump_logs
+    exit "$SETUP_RC"
+  fi
+  echo "setup branch $FINISHED_SETUP_NAME completed"
+  REMAINING_SETUP_PIDS=()
+  for pid in "${SETUP_PIDS[@]}"; do
+    [ "$pid" = "$FINISHED_SETUP_PID" ] || REMAINING_SETUP_PIDS+=("$pid")
+  done
+  SETUP_PIDS=("${REMAINING_SETUP_PIDS[@]}")
+done
+
+echo "== [1b/7] NCCL collective gate =="
+if [ "$TRAIN_GPUS" -gt 1 ]; then
+  # RunPod containers can expose CUDA P2P or cuMem capabilities that fail when
+  # NCCL first uses them. Force the portable shared-memory transport and verify
+  # barrier/all-reduce/broadcast before model initialization consumes time.
+  CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TRAIN_GPUS-1))) \
+    NCCL_P2P_DISABLE=1 NCCL_CUMEM_ENABLE=0 NCCL_CUMEM_HOST_ENABLE=0 \
+    timeout 90s /opt/venv-nexrl/bin/torchrun --standalone \
+      --nproc-per-node "$TRAIN_GPUS" -m summit.nccl_probe
+fi
+
+echo "== [2/7] data prep (deepswe) =="
+/opt/venv-nexrl/bin/python -m summit.data_prep \
+  --tasks-dir /workspace/deep-swe/tasks \
+  --tasks "{{ tasks_csv }}" \
+  --out "$NEXRL_DATA_PATH/deepswe"
+
+echo "== [3/7] student inference (SGLang) =="
+# NexRL's k8s template patches sglang's openai logprobs to return token ids.
+SGL_UTILS=$(/opt/venv-sglang/bin/python -c "import sglang, pathlib; print(pathlib.Path(sglang.__file__).parent)")
+sed -i 's/for logprob, _, token_text in token_logprobs:/for logprob, token_id, token_text in token_logprobs:/g' "$SGL_UTILS/srt/entrypoints/openai/utils.py" || true
+sed -i 's/ret_logprobs.tokens.append(token_text)/ret_logprobs.tokens.append(str(token_id))/g' "$SGL_UTILS/srt/entrypoints/openai/utils.py" || true
+
+ROLLOUT_START=$((TRAIN_GPUS))
+ROLLOUT_END=$((TRAIN_GPUS + ROLLOUT_GPUS - 1))
+CUDA_VISIBLE_DEVICES=$(seq -s, $ROLLOUT_START $ROLLOUT_END) \
+  nohup /opt/venv-sglang/bin/python -m sglang.launch_server \
+    --model-path "$STUDENT_MODEL" --served-model-name "$SERVED_NAME" \
+    --trust-remote-code --host 0.0.0.0 --port 8001 \
+    --tp-size "$ROLLOUT_GPUS" --mem-fraction-static 0.85{% if blackwell %} --attention-backend triton{% endif %} \
+    > "$EXPERIMENT_PATH/sglang.log" 2>&1 &
+
+echo "== [4/7] NexRL API server =="
+nohup /opt/venv-nexrl/bin/python -m nexrl.train_service_backend.api.api_server \
+    --host 0.0.0.0 --port 8000 > "$EXPERIMENT_PATH/api_server.log" 2>&1 &
+for i in $(seq 1 60); do
+  curl -sf "http://127.0.0.1:8000/health" > /dev/null 2>&1 && break
+  sleep 2
+done
+curl -sf "http://127.0.0.1:8000/health" > /dev/null || { echo "API server failed to start"; dump_logs; exit 1; }
+
+echo "== [5/7] FSDP training workers (GPUs 0-$((TRAIN_GPUS-1))) =="
+cd "$SUMMIT_REPO_DIR"
+WORKER_NCCL_ENV=()
+if [ "$TRAIN_GPUS" -gt 1 ]; then
+  WORKER_NCCL_ENV=(NCCL_P2P_DISABLE=1 NCCL_CUMEM_ENABLE=0 NCCL_CUMEM_HOST_ENABLE=0)
+fi
+env CUDA_VISIBLE_DEVICES=$(seq -s, 0 $((TRAIN_GPUS-1))) \
+  "${WORKER_NCCL_ENV[@]}" \
+  NEXRL_PATH="$SUMMIT_REPO_DIR" IDENTIFIER=student RANK=0 WORLD_SIZE=1 \
+  MASTER_ADDR=127.0.0.1 MASTER_PORT=23456 \
+  nohup /opt/venv-nexrl/bin/torchrun --nproc-per-node "$TRAIN_GPUS" \
+    --node_rank=0 --nnodes=1 --master-addr=127.0.0.1 --master-port=23456 \
+    -m nexrl.train_service_backend.distributed.worker_process \
+    --api-server-url http://127.0.0.1:8000 --backend fsdp --identifier student \
+    --dispatch-mode scatter > "$EXPERIMENT_PATH/workers-student.log" 2>&1 &
+
+# Stream all service logs to stdout so `summit logs` shows live progress.
+touch "$EXPERIMENT_PATH/sglang.log" "$EXPERIMENT_PATH/api_server.log" "$EXPERIMENT_PATH/workers-student.log" "$EXPERIMENT_PATH/router.log"
+tail -F "$EXPERIMENT_PATH/sglang.log" "$EXPERIMENT_PATH/api_server.log" "$EXPERIMENT_PATH/workers-student.log" "$EXPERIMENT_PATH/router.log" 2>/dev/null &
+
+echo "waiting for SGLang to come up..."
+for i in $(seq 1 300); do
+  curl -sf "http://127.0.0.1:8001/health" > /dev/null 2>&1 && break
+  sleep 5
+done
+curl -sf "http://127.0.0.1:8001/health" > /dev/null || { echo "SGLang failed to start"; dump_logs; exit 1; }
+
+echo "starting SGLang router (NexRL weight-sync endpoint)..."
+nohup /opt/venv-sglang/bin/python -m sglang_router.launch_router \
+  --host 0.0.0.0 --port 12345 --policy round_robin \
+  --worker-urls http://127.0.0.1:8001 \
+  > "$EXPERIMENT_PATH/router.log" 2>&1 &
+for i in $(seq 1 30); do
+  curl -sf "http://127.0.0.1:12345/health" > /dev/null 2>&1 && break
+  sleep 2
+done
+curl -sf "http://127.0.0.1:12345/health" > /dev/null || { echo "router failed to start"; dump_logs; exit 1; }
+
+echo "== [6/7] driver (OPD loop) =="
+rm -f "$SUMMIT_TRAIN_SUCCESS_FILE" "$SUMMIT_ROLLOUT_RESULT_FILE"
+set +e
+TRAIN_CONFIG="$EXPERIMENT_PATH/rl_train.yaml" \
+  /opt/venv-nexrl/bin/python -m summit.nexrl_ext.boot \
+  --config-path "$EXPERIMENT_PATH" --config-name rl_train &
+DRIVER_PID=$!
+WATCHDOG_RC=0
+while kill -0 "$DRIVER_PID" 2>/dev/null; do
+  if [ -f "$SUMMIT_ROLLOUT_RESULT_FILE" ]; then
+    ROLLOUT_RESULTS=$(wc -l < "$SUMMIT_ROLLOUT_RESULT_FILE")
+    if [ "$ROLLOUT_RESULTS" -gt 0 ] && [ $((ROLLOUT_RESULTS % {{ batch_size }})) -eq 0 ]; then
+      PRODUCTIVE=$(tail -n {{ batch_size }} "$SUMMIT_ROLLOUT_RESULT_FILE" | awk '{s += $1} END {print s + 0}')
+      if [ "$PRODUCTIVE" -eq 0 ]; then
+        echo "rollout batch produced zero trainable trajectories; stopping paid VM"
+        WATCHDOG_RC=97
+        kill "$DRIVER_PID" 2>/dev/null || true
+        break
+      fi
+    fi
+  fi
+  sleep 2
+done
+wait "$DRIVER_PID"
+DRIVER_RC=$?
+set -e
+echo "driver exited with $DRIVER_RC"
+[ "$WATCHDOG_RC" -ne 0 ] && { dump_logs; exit "$WATCHDOG_RC"; }
+[ $DRIVER_RC -ne 0 ] && { dump_logs; exit $DRIVER_RC; }
+SUCCESSFUL_UPDATES=0
+if [ -f "$SUMMIT_TRAIN_SUCCESS_FILE" ]; then
+  SUCCESSFUL_UPDATES=$(wc -l < "$SUMMIT_TRAIN_SUCCESS_FILE")
+fi
+if [ "$SUCCESSFUL_UPDATES" -ne {{ total_train_steps }} ]; then
+  echo "training incomplete: $SUCCESSFUL_UPDATES/{{ total_train_steps }} updates succeeded"
+  dump_logs
+  exit 1
+fi
+echo "verified $SUCCESSFUL_UPDATES/{{ total_train_steps }} successful training updates"
+
+echo "== [7/7] export + push to HF =="
+# The workers need a moment to return their training handle to IDLE after the
+# driver exits. Give them real slack before the FIRST convert attempt — a
+# first attempt that catches a FORWARD handle poisons torch's unshard ctx.
+sleep 45
+CONVERTED=0
+for attempt in $(seq 1 8); do
+  sleep 10
+  R=$(curl -sf -X POST "http://127.0.0.1:8000/convert_checkpoint_to_huggingface" \
+    -H "Content-Type: application/json" \
+    -d "{\"local_path\": \"$HF_EXPORT_DIR\"}" 2>/dev/null) || true
+  N=$(echo "$R" | grep -oE "on [0-9]+ workers" | grep -oE "[0-9]+" || true)
+  if [ "${N:-0}" -ge "$TRAIN_GPUS" ]; then CONVERTED=1; break; fi
+  echo "convert attempt $attempt: workers converted=${N:-0}/$TRAIN_GPUS, retrying..."
+done
+[ "$CONVERTED" = "1" ] || { echo "checkpoint conversion failed"; dump_logs; exit 1; }
+
+/opt/venv-nexrl/bin/python -m summit.export \
+  --hf-dir "$HF_EXPORT_DIR" --repo "{{ hf_repo }}" --private
+echo "summit: DONE — weights at https://huggingface.co/{{ hf_repo }}"

@@ -1,0 +1,63 @@
+# Full causal 9B training: the parent of the Typed Decisions specialist.
+# Prepare canonical JSONL + cached targets first; see docs/data.md.
+schema_version: 2
+recipe: decision
+project_name: summit-decision
+experiment_name: decision-9b
+
+model:
+  name: Qwen/Qwen3.5-9B
+  revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  adapter: causal_lm
+  dtype: bfloat16
+  gradient_checkpointing: true
+  adaptation: full
+
+data:
+  train: ../data/decision-9b/train.jsonl
+  validation: ../data/decision-9b/validation.jsonl
+  max_length: 2048
+  max_candidates: 8
+
+objective:
+  type: candidate_distillation
+  alpha: 0.5
+  temperature: 1.0
+
+training:
+  backend: torch_single
+  comparison: ce_kd
+  device: cuda
+  epochs: 1
+  max_steps: 128
+  batch_size: 1
+  gradient_accumulation: 8
+  learning_rate: 2.0e-7
+  weight_decay: 0.0
+  max_grad_norm: 1.0
+  seed: 42
+  evaluate_reversed_options: true
+
+summitConfig:
+  backends: [runpod]
+  regions: [US-WA-2]
+  fleet: summit-decision-qual
+  resources:
+    gpu: B300-288GB:1
+    rollout_gpus: 0
+    shm_size: 16GB
+    disk: 150GB
+  spot_policy: on-demand
+  max_duration: 75m
+  max_price: 8.0
+  retry_on_no_capacity: false
+  retry_on_error: false
+  retry_on_interruption: false
+  retry_duration: 20m
+  env: []
+  output:
+    directory: ../outputs/decision-9b
+    hf_push:
+      repo: YOUR_HF_USERNAME/summit-decision-9b
+      private: true
+      replace: false

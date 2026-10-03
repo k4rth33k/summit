@@ -1,0 +1,40 @@
+# Private workspace history and generated assets. Keep these locally.
+/notes/
+/research/
+/artifacts/
+/checkpoints/
+/data/
+/outputs/
+/summit-checks/
+/summit-dry-run/
+/runs/
+
+# Exactly three supported entry-point recipes. Personal variants stay local.
+/examples/*
+!/examples/deepswe_opd.yaml
+!/examples/decision_9b.yaml
+!/examples/specialize_9b.yaml
+
+# Local settings and credentials (the empty template is public).
+.env
+.env.*
+!.env.example
+.venv*/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+*.egg-info/
+/build/
+/dist/
+*.log
+*.safetensors
+*.pt
+*.pth
+*.ckpt
+.DS_Store
+
+# Ad-hoc teacher endpoint probe; maintained implementation/tests live in summit/.
+/scripts/probe_teacher.py

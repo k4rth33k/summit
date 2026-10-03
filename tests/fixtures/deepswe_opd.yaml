@@ -1,0 +1,64 @@
+# summit v0.1 demo: OPD of Qwen3.8-2.4T-A95B -> Qwen3.5-9B on DeepSWE tasks.
+project_name: summit
+experiment_name: deepswe-opd-smoke
+
+model_name: Qwen/Qwen3.5-9B
+lora_rank: 32                  # recorded for LoRA-capable backends; v0.1 self-hosted = full FT
+learning_rate: 1.0e-4
+loss_fn: importance_sampling
+
+algorithm:
+  type: distillation
+  kl_penalty_coef: 1.0
+  kl_discount_factor: 0.0
+  temperature: 0.8
+
+teacher:
+  backend: fireworks
+  # Qwen3.8-2.4T-A95B ("Qwen 3.8 Max") — serverless on Fireworks, echo logprobs verified
+  base_model: accounts/fireworks/models/qwen3p8-2p4t-a95b
+
+data:
+  source: deepswe
+  # two small smoke tasks from deep-swe/tasks/
+  tasks: [abs-module-cache-flags, abs-stepped-slices]
+  batch_size: 4
+  rollout_repeat_n: 1
+  # A saturated 8K synthetic batch exceeds even H200-141GB in Phantora.
+  # Keep this smoke run at 4K; expand only after comparing simulated and real peaks.
+  max_prompt_length: 2048
+  max_response_length: 2048
+  max_sequence_length: 4096
+
+rollout:
+  agent: mini-swe-agent
+  sandbox: modal
+  num_workers: 2
+  step_limit: 20
+
+total_train_steps: 2
+save_freq: 2
+logger: [console, wandb]
+
+summitConfig:
+  backends: [runpod]
+  spot_policy: on-demand
+  resources:
+    # 5xH200 on RunPod: 4 GPUs train + 1 serves rollouts. The 8-GPU shape had
+    # no current RunPod offer; this available shape completed the 4K Phantora
+    # update at about 130 GiB peak reserved memory per 141 GiB training rank.
+    # Phantora reports the conservative 8192-token shape OOMs even at 141GB.
+    # Keep the rollouts
+    # tp=1: Qwen3.5's Gated DeltaNet kernels drift logits across a Mamba tp=2
+    # boundary, breaking mini-swe-agent's command regex (RepeatedFormatError).
+    gpu: H200-141GB:5
+    shm_size: 64GB
+    disk: 500GB
+    rollout_gpus: 1
+  # Bound this qualification run to the available RunPod credit window.
+  max_duration: 90m
+  env: [HF_TOKEN, FIREWORKS_API_KEY, WANDB_API_KEY, MODAL_TOKEN_ID, MODAL_TOKEN_SECRET]
+  output:
+    hf_push:
+      repo: example-org/test-model
+      private: true

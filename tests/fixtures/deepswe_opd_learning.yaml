@@ -1,0 +1,82 @@
+# Budgeted learning qualification: four ordered updates on 5xH200.
+# Batch 0 and batch 3 contain the same anchor tasks, so their pre-update
+# distillation metrics compare the base student with the student after three
+# weight updates. The middle batches add eight distinct training tasks.
+project_name: summit
+experiment_name: deepswe-opd-learning
+
+model_name: Qwen/Qwen3.5-9B
+lora_rank: 32
+learning_rate: 1.0e-4
+loss_fn: importance_sampling
+
+algorithm:
+  type: distillation
+  kl_penalty_coef: 1.0
+  kl_discount_factor: 0.0
+  temperature: 0.8
+
+teacher:
+  backend: fireworks
+  base_model: accounts/fireworks/models/qwen3p8-2p4t-a95b
+
+data:
+  source: deepswe
+  # Four-task anchor, eight distinct tasks, then the anchor again.
+  tasks:
+    - abs-module-cache-flags
+    - abs-stepped-slices
+    - bandit-incremental-cache-control
+    - httpx-deterministic-cookie-store
+    - bandit-interprocedural-taint-checks
+    - bandit-structured-nosec-directives
+    - httpx-multipart-response-parsing
+    - httpx-streaming-json-iteration
+    - koota-composite-trait-aspects
+    - koota-deferred-mutation-buffer
+    - koota-entity-snapshot-rollback
+    - koota-pair-relation-tracking
+    - abs-module-cache-flags
+    - abs-stepped-slices
+    - bandit-incremental-cache-control
+    - httpx-deterministic-cookie-store
+  batch_size: 4
+  shuffle: false
+  rollout_repeat_n: 1
+  max_prompt_length: 2048
+  max_response_length: 2048
+  max_sequence_length: 4096
+
+rollout:
+  agent: mini-swe-agent
+  sandbox: modal
+  num_workers: 4
+  step_limit: 20
+
+total_train_steps: 4
+save_freq: 4
+logger: [console, wandb]
+
+summitConfig:
+  backends: [runpod]
+  spot_policy: on-demand
+  resources:
+    gpu: H200,H200NVL-141GB:5
+    shm_size: 64GB
+    disk: 500GB
+    rollout_gpus: 1
+  # Accept either compatible Hopper 141+ GiB model. At the worst observed
+  # rate ($22.95/hour), the hard cap is below $25 and leaves more than $11 of
+  # the stated $36 balance. Expected runtime is 30-40 minutes.
+  max_duration: 65m
+  retry_on_no_capacity: true
+  retry_on_error: false
+  retry_on_interruption: false
+  # Capacity waiting is free. Keep this longer than the runtime cap so a
+  # scarce five-card host can be claimed without permitting workload retries.
+  retry_duration: 2h
+  env: [HF_TOKEN, FIREWORKS_API_KEY, WANDB_API_KEY, MODAL_TOKEN_ID, MODAL_TOKEN_SECRET]
+  output:
+    hf_push:
+      repo: example-org/test-model
+      private: true
