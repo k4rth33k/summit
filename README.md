@@ -167,3 +167,18 @@ and [operations](docs/operations.md).
 Summit is distributed under the [Apache 2.0 license](LICENSE). Installation is
 currently supported from a source checkout; datasets and trained checkpoints
 are not bundled.
+
+## Acknowledgements
+
+Summit is built using open-source projects whose maintainers and contributors
+make this work possible:
+
+- [dstack](https://github.com/dstackai/dstack) — GPU provisioning and training-job
+  orchestration on infrastructure you control.
+- [Phantora](https://github.com/QDelta/Phantora) — virtual-GPU simulation used by
+  Summit's experimental training-validation path.
+- [NexRL](https://github.com/nex-agi/NexRL) — the self-hosted training backend
+  used by Summit's DeepSWE OPD recipe.
+
+Thank you to these projects and their communities for building and sharing
+open training infrastructure.
